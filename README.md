@@ -86,3 +86,4 @@ Uses [deepseek-ai/DeepSeek-OCR](https://huggingface.co/deepseek-ai/DeepSeek-OCR)
 ## License
 
 Part of the BOFFO financial platform.
+Build triggered with fixed Docker Hub token
