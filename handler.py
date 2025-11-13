@@ -1,162 +1,233 @@
 """
-RunPod Serverless Handler for DeepSeek OCR
-Processes PDF extractions on-demand with automatic scaling
+RunPod Serverless Handler - Tesseract OCR for Financial PDFs
+Extracts portfolio data with confidence scoring
 """
 
 import runpod
-import torch
+import pytesseract
 import base64
 import json
 import time
-from transformers import AutoModelForCausalLM, AutoTokenizer
+import re
 from pdf2image import convert_from_bytes
-from io import BytesIO
+from PIL import Image
+import cv2
+import numpy as np
 
-# Lazy load model (on first request)
-model = None
-tokenizer = None
 
-def load_model():
-    """Load model on first request (cached after first load)"""
-    global model, tokenizer
+def preprocess_image(image):
+    """Enhance image quality for better OCR"""
+    # Convert PIL to OpenCV
+    img = np.array(image)
 
-    if model is None:
-        print("Loading DeepSeek OCR model (first request)...")
+    # Convert to grayscale
+    gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+
+    # Apply thresholding to make text clearer
+    _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+    # Noise removal
+    denoised = cv2.fastNlMeansDenoising(thresh, h=10)
+
+    return Image.fromarray(denoised)
+
+
+def extract_text_from_image(image):
+    """Extract text using Tesseract OCR"""
+    # Preprocess for better accuracy
+    processed = preprocess_image(image)
+
+    # Extract text with config for financial documents
+    custom_config = r'--oem 3 --psm 6'
+    text = pytesseract.image_to_string(processed, config=custom_config)
+
+    return text
+
+
+def extract_isin_pattern(text):
+    """Extract ISINs using regex (2 letters + 10 alphanumeric)"""
+    isin_pattern = r'\b[A-Z]{2}[A-Z0-9]{10}\b'
+    isins = re.findall(isin_pattern, text)
+    return list(set(isins))  # Remove duplicates
+
+
+def extract_currency(text):
+    """Detect currency from text"""
+    currencies = ['USD', 'EUR', 'CHF', 'GBP', 'JPY']
+    for curr in currencies:
+        if curr in text:
+            return curr
+    return 'USD'  # Default
+
+
+def extract_numbers(text):
+    """Extract numbers from text (handles Swiss format with apostrophes)"""
+    # Match numbers like: 1'234'567.89 or 1234567.89
+    number_pattern = r"[\d']+(?:\.\d{2})?"
+    matches = re.findall(number_pattern, text)
+
+    numbers = []
+    for match in matches:
         try:
-            model = AutoModelForCausalLM.from_pretrained(
-                "deepseek-ai/DeepSeek-OCR",
-                trust_remote_code=True,
-                torch_dtype=torch.bfloat16,
-                device_map="auto",
-                low_cpu_mem_usage=True
-            )
+            # Remove apostrophes and convert
+            clean = match.replace("'", "")
+            num = float(clean)
+            if num > 100:  # Filter out small numbers (likely dates/counts)
+                numbers.append(num)
+        except:
+            pass
 
-            tokenizer = AutoTokenizer.from_pretrained(
-                "deepseek-ai/DeepSeek-OCR",
-                trust_remote_code=True
-            )
-
-            print(f"✅ Model loaded on {model.device}")
-            print(f"GPU available: {torch.cuda.is_available()}")
-        except Exception as e:
-            print(f"❌ Model loading failed: {e}")
-            raise
-
-    return model, tokenizer
+    return numbers
 
 
-def generate_extraction(prompt, image):
-    """Generate extraction using DeepSeek OCR"""
-    try:
-        inputs = tokenizer(
-            prompt,
-            return_tensors="pt",
-            padding=True
-        ).to(model.device)
+def extract_dates(text):
+    """Extract dates in various formats"""
+    # Matches: 30.09.2025, 2025-09-30, etc.
+    date_patterns = [
+        r'\d{2}\.\d{2}\.\d{4}',
+        r'\d{4}-\d{2}-\d{2}',
+        r'\d{2}/\d{2}/\d{4}'
+    ]
 
-        with torch.no_grad():
-            outputs = model.generate(
-                **inputs,
-                images=image,
-                max_new_tokens=2048,
-                temperature=0.1,
-                do_sample=False
-            )
+    for pattern in date_patterns:
+        matches = re.findall(pattern, text)
+        if matches:
+            return matches[0]
 
-        result = tokenizer.decode(outputs[0], skip_special_tokens=True)
-        result = result.replace(prompt, "").strip()
-
-        # Try to parse as JSON
-        try:
-            return json.loads(result)
-        except json.JSONDecodeError:
-            return {"raw_text": result}
-
-    except Exception as e:
-        return {"error": str(e)}
+    return None
 
 
-def extract_portfolio_summary(image):
-    """Extract portfolio summary"""
-    prompt = """<image>
-<|grounding|>This is a bank portfolio statement.
-
-Extract the portfolio summary in JSON format:
-{
-  "client_id": "string (account number)",
-  "client_name": "string (if visible)",
-  "statement_date": "string (YYYY-MM-DD)",
-  "total_portfolio_value": "number",
-  "currency": "string (USD, EUR, CHF, etc.)",
-  "ytd_performance_pct": "number (percentage)",
-  "ytd_gain_loss": "number",
-  "bank_name": "string"
-}
-
-Look for labels like: Total Assets, Portfolio Value, NAV, Performance, Return, YTD.
-Be smart about currency symbols and number formats.
-Output ONLY valid JSON, no other text.
-"""
-    return generate_extraction(prompt, image)
-
-
-def extract_holdings(image):
-    """Extract holdings table"""
-    prompt = """<image>
-<|grounding|>This is a bank portfolio statement with holdings.
-
-Extract ALL securities in JSON format:
-{
-  "holdings": [
-    {
-      "security_name": "string",
-      "isin": "string (12 chars, or null)",
-      "ticker": "string (or null)",
-      "asset_class": "string (Bond/Equity/Structured Product/Cash/Other)",
-      "quantity": "number",
-      "currency": "string",
-      "market_value": "number",
-      "percentage": "number (if shown)",
-      "maturity_date": "string (YYYY-MM-DD, or null)"
+def parse_portfolio_summary(all_text):
+    """Extract portfolio summary from OCR text"""
+    summary = {
+        "currency": extract_currency(all_text),
+        "statement_date": extract_dates(all_text),
+        "total_portfolio_value": None,
+        "client_id": None
     }
-  ]
-}
 
-Look for table headers: Security, ISIN, Ticker, Quantity, Value, Price.
-ISINs usually start with 2 letters followed by 10 alphanumeric characters.
-Be smart about currency symbols and number formats.
-Output ONLY valid JSON, no other text.
-"""
-    return generate_extraction(prompt, image)
+    # Extract total value (largest number found)
+    numbers = extract_numbers(all_text)
+    if numbers:
+        summary["total_portfolio_value"] = max(numbers)
+
+    # Extract client ID if present
+    client_patterns = [
+        r'Client[:\s]+([A-Z0-9]+)',
+        r'Account[:\s]+([A-Z0-9]+)',
+        r'Portfolio[:\s]+([A-Z0-9]+)'
+    ]
+
+    for pattern in client_patterns:
+        match = re.search(pattern, all_text, re.IGNORECASE)
+        if match:
+            summary["client_id"] = match.group(1)
+            break
+
+    return summary
 
 
-def extract_asset_allocation(image):
-    """Extract asset allocation"""
-    prompt = """<image>
-<|grounding|>This is a bank portfolio statement.
+def parse_holdings(all_text, isins):
+    """Parse holdings from OCR text using ISINs as anchors"""
+    holdings = []
 
-Extract asset allocation in JSON format:
-{
-  "asset_allocation": {
-    "bonds": "number (percentage)",
-    "equities": "number (percentage)",
-    "structured_products": "number (percentage)",
-    "cash": "number (percentage)",
-    "alternatives": "number (percentage)",
-    "other": "number (percentage)"
-  }
-}
+    # Split text into lines
+    lines = all_text.split('\n')
 
-Look for: Asset Allocation, Portfolio Breakdown, Investment Mix.
-Categories: Bonds, Fixed Income, Equities, Stocks, Structured Products, Cash, Liquidity.
-Output ONLY valid JSON, no other text.
-"""
-    return generate_extraction(prompt, image)
+    for isin in isins:
+        # Find lines containing this ISIN
+        for i, line in enumerate(lines):
+            if isin in line:
+                # Extract data from this line and nearby lines
+                context = ' '.join(lines[max(0, i-1):min(len(lines), i+3)])
+
+                # Extract numbers from context
+                numbers = extract_numbers(context)
+
+                holding = {
+                    "isin": isin,
+                    "security_name": extract_security_name(line, isin),
+                    "quantity": numbers[0] if len(numbers) > 0 else None,
+                    "price": numbers[1] if len(numbers) > 1 else None,
+                    "market_value": numbers[2] if len(numbers) > 2 else (numbers[1] if len(numbers) > 1 else None),
+                    "currency": extract_currency(context),
+                    "asset_class": classify_asset(line)
+                }
+
+                holdings.append(holding)
+                break
+
+    return holdings
+
+
+def extract_security_name(line, isin):
+    """Extract security name from line (text before ISIN)"""
+    isin_pos = line.find(isin)
+    if isin_pos > 0:
+        name = line[:isin_pos].strip()
+        # Clean up
+        name = re.sub(r'\s+', ' ', name)
+        name = name[:100]  # Max 100 chars
+        return name if name else "Unknown Security"
+    return "Unknown Security"
+
+
+def classify_asset(line):
+    """Classify asset type based on keywords"""
+    line_lower = line.lower()
+
+    if any(word in line_lower for word in ['bond', 'note', 'treasury', 'govt']):
+        return 'BOND'
+    elif any(word in line_lower for word in ['struct', 'product', 'certif']):
+        return 'STRUCTURED_PRODUCT'
+    elif any(word in line_lower for word in ['equity', 'stock', 'share']):
+        return 'EQUITY'
+    elif any(word in line_lower for word in ['cash', 'liquidity']):
+        return 'CASH'
+    else:
+        return 'OTHER'
+
+
+def calculate_confidence(summary, holdings, all_text):
+    """
+    Calculate extraction confidence score (0-100%)
+
+    Scoring:
+    - ISINs found: 40 points (0-10 ISINs = 0-40 points)
+    - Summary completeness: 30 points
+    - Holdings data quality: 20 points
+    - Text quality: 10 points
+    """
+    score = 0
+
+    # 1. ISINs found (40 points max)
+    isin_count = len(holdings)
+    score += min(40, isin_count * 4)
+
+    # 2. Summary completeness (30 points)
+    if summary.get('total_portfolio_value'):
+        score += 10
+    if summary.get('statement_date'):
+        score += 10
+    if summary.get('client_id'):
+        score += 10
+
+    # 3. Holdings data quality (20 points)
+    if holdings:
+        holdings_with_value = sum(1 for h in holdings if h.get('market_value'))
+        score += min(20, (holdings_with_value / len(holdings)) * 20)
+
+    # 4. Text quality (10 points)
+    # Check for garbled text or too many special characters
+    text_quality = len(re.findall(r'[A-Za-z0-9]', all_text)) / max(1, len(all_text))
+    score += text_quality * 10
+
+    return min(100, int(score))
 
 
 def handler(job):
     """
-    RunPod serverless handler
+    RunPod serverless handler for Tesseract OCR extraction
 
     Input format:
     {
@@ -169,17 +240,14 @@ def handler(job):
     Output format:
     {
         "status": "success",
+        "confidence_score": 85,
+        "requires_review": false (if < 90%),
         "summary": {...},
         "holdings": [...],
-        "asset_allocation": {...},
-        "processing_time_seconds": 28.5,
-        "pages_processed": 5
+        "processing_time_seconds": 12.5
     }
     """
     try:
-        # Load model on first request (cached afterward)
-        load_model()
-
         job_input = job['input']
 
         # Get PDF data
@@ -189,75 +257,95 @@ def handler(job):
         if not pdf_base64:
             return {"error": "No PDF data provided"}
 
-        print(f"Processing: {filename}")
+        print(f"✓ Processing: {filename}")
         start_time = time.time()
 
         # Decode PDF
         pdf_bytes = base64.b64decode(pdf_base64)
 
         # Convert to images
-        print("Converting PDF to images...")
+        print("✓ Converting PDF to images (300 DPI)...")
         images = convert_from_bytes(pdf_bytes, dpi=300)
-        print(f"Converted {len(images)} pages")
+        print(f"✓ Converted {len(images)} pages")
 
-        # Initialize results
+        # Extract text from all pages
+        all_text = ""
+        print("✓ Extracting text with Tesseract OCR...")
+
+        for i, image in enumerate(images):
+            print(f"  Page {i+1}/{len(images)}...")
+            text = extract_text_from_image(image)
+            all_text += text + "\n\n"
+
+        print(f"✓ Extracted {len(all_text)} characters")
+
+        # Parse data
+        print("✓ Parsing portfolio data...")
+
+        # Extract ISINs first (these are our anchors)
+        isins = extract_isin_pattern(all_text)
+        print(f"✓ Found {len(isins)} ISINs")
+
+        # Extract summary
+        summary = parse_portfolio_summary(all_text)
+
+        # Extract holdings
+        holdings = parse_holdings(all_text, isins)
+
+        # Calculate confidence
+        confidence = calculate_confidence(summary, holdings, all_text)
+        print(f"✓ Confidence score: {confidence}%")
+
+        # Prepare results
         results = {
             "status": "success",
             "pdf_filename": filename,
             "pages_processed": len(images),
-            "summary": None,
-            "holdings": [],
-            "asset_allocation": None,
-            "confidence_score": 0.90,
-            "extraction_method": "deepseek_ocr_serverless"
+            "confidence_score": confidence / 100.0,  # 0.0 to 1.0
+            "requires_review": confidence < 90,
+            "summary": summary,
+            "holdings": holdings,
+            "asset_allocation": {
+                "bonds": sum(1 for h in holdings if h.get('asset_class') == 'BOND'),
+                "structured_products": sum(1 for h in holdings if h.get('asset_class') == 'STRUCTURED_PRODUCT'),
+                "equities": sum(1 for h in holdings if h.get('asset_class') == 'EQUITY'),
+                "cash": sum(1 for h in holdings if h.get('asset_class') == 'CASH'),
+                "other": sum(1 for h in holdings if h.get('asset_class') == 'OTHER')
+            },
+            "extraction_method": "tesseract_ocr",
+            "processing_time_seconds": time.time() - start_time
         }
 
-        # Process each page
-        for i, image in enumerate(images):
-            print(f"Processing page {i+1}/{len(images)}")
+        # If low confidence, include PDF for Claude Code review
+        if confidence < 90:
+            print(f"⚠ Low confidence ({confidence}%) - flagging for review")
+            results["review_data"] = {
+                "pdf_base64": pdf_base64,
+                "extracted_text_sample": all_text[:1000],  # First 1000 chars
+                "message": "Extraction confidence below 90% - PDF saved for Claude Code assistance"
+            }
 
-            # Extract summary (page 1)
-            if i == 0:
-                print("  Extracting portfolio summary...")
-                summary = extract_portfolio_summary(image)
-                if summary and not summary.get("error"):
-                    results["summary"] = summary
-                    print("  ✅ Found summary")
-
-            # Extract holdings (any page)
-            print("  Extracting holdings...")
-            holdings = extract_holdings(image)
-            if holdings and "holdings" in holdings and len(holdings["holdings"]) > 0:
-                results["holdings"].extend(holdings["holdings"])
-                print(f"  ✅ Found {len(holdings['holdings'])} holdings")
-
-            # Extract asset allocation (page 1)
-            if i == 0 and results["asset_allocation"] is None:
-                print("  Extracting asset allocation...")
-                allocation = extract_asset_allocation(image)
-                if allocation and "asset_allocation" in allocation:
-                    results["asset_allocation"] = allocation["asset_allocation"]
-                    print("  ✅ Found asset allocation")
-
-        results["processing_time_seconds"] = time.time() - start_time
-
-        print(f"✅ Extraction complete in {results['processing_time_seconds']:.2f}s")
-        print(f"   Summary: {'Yes' if results['summary'] else 'No'}")
-        print(f"   Holdings: {len(results['holdings'])}")
-        print(f"   Allocation: {'Yes' if results['asset_allocation'] else 'No'}")
+        print(f"✓ Extraction complete in {results['processing_time_seconds']:.2f}s")
+        print(f"  Summary: {'Yes' if summary.get('total_portfolio_value') else 'No'}")
+        print(f"  Holdings: {len(holdings)}")
+        print(f"  Requires Review: {'Yes' if results['requires_review'] else 'No'}")
 
         return results
 
     except Exception as e:
         print(f"❌ Error: {str(e)}")
+        import traceback
+        traceback.print_exc()
+
         return {
             "status": "error",
-            "error": str(e)
+            "error": str(e),
+            "requires_review": True
         }
 
 
 # Start the serverless worker
 if __name__ == "__main__":
-    print("🚀 Starting RunPod serverless worker...")
-    print(f"GPU: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'None'}")
+    print("🚀 Starting RunPod serverless worker (Tesseract OCR)...")
+    print("✓ Tesseract version:", pytesseract.get_tesseract_version())
     runpod.serverless.start({"handler": handler})
