@@ -20,13 +20,8 @@ RUN pip install --no-cache-dir \
     pdf2image==1.16.3 \
     runpod==1.5.0
 
-# Download DeepSeek OCR model (baked into image for fast cold starts)
-RUN python -c "from transformers import AutoModelForCausalLM, AutoTokenizer; \
-    import torch; \
-    print('Downloading DeepSeek OCR model...'); \
-    model = AutoModelForCausalLM.from_pretrained('deepseek-ai/DeepSeek-OCR', trust_remote_code=True, torch_dtype=torch.bfloat16); \
-    tokenizer = AutoTokenizer.from_pretrained('deepseek-ai/DeepSeek-OCR', trust_remote_code=True); \
-    print('Model cached in image')"
+# Note: Model will be downloaded on first run to avoid build timeout
+# This makes the Docker image much smaller and builds faster
 
 # Copy handler code
 COPY handler.py /app/handler.py
