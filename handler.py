@@ -12,23 +12,37 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from pdf2image import convert_from_bytes
 from io import BytesIO
 
-# Load model once at startup (cached in container)
-print("Loading DeepSeek OCR model...")
-model = AutoModelForCausalLM.from_pretrained(
-    "deepseek-ai/DeepSeek-OCR",
-    trust_remote_code=True,
-    torch_dtype=torch.bfloat16,
-    device_map="auto",
-    low_cpu_mem_usage=True
-)
+# Lazy load model (on first request)
+model = None
+tokenizer = None
 
-tokenizer = AutoTokenizer.from_pretrained(
-    "deepseek-ai/DeepSeek-OCR",
-    trust_remote_code=True
-)
+def load_model():
+    """Load model on first request (cached after first load)"""
+    global model, tokenizer
 
-print(f"✅ Model loaded on {model.device}")
-print(f"GPU available: {torch.cuda.is_available()}")
+    if model is None:
+        print("Loading DeepSeek OCR model (first request)...")
+        try:
+            model = AutoModelForCausalLM.from_pretrained(
+                "deepseek-ai/DeepSeek-OCR",
+                trust_remote_code=True,
+                torch_dtype=torch.bfloat16,
+                device_map="auto",
+                low_cpu_mem_usage=True
+            )
+
+            tokenizer = AutoTokenizer.from_pretrained(
+                "deepseek-ai/DeepSeek-OCR",
+                trust_remote_code=True
+            )
+
+            print(f"✅ Model loaded on {model.device}")
+            print(f"GPU available: {torch.cuda.is_available()}")
+        except Exception as e:
+            print(f"❌ Model loading failed: {e}")
+            raise
+
+    return model, tokenizer
 
 
 def generate_extraction(prompt, image):
@@ -163,6 +177,9 @@ def handler(job):
     }
     """
     try:
+        # Load model on first request (cached afterward)
+        load_model()
+
         job_input = job['input']
 
         # Get PDF data
